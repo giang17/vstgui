@@ -5,11 +5,15 @@
 #include "win32taskexecutor.h"
 #include "../../vstguidebug.h"
 #include <atomic>
-#include <ppltasks.h>
 #include <string>
 #include <thread>
 #include <mutex>
 #include <vector>
+#ifdef __MINGW32__
+#include <future>
+#else
+#include <ppltasks.h>
+#endif
 
 //------------------------------------------------------------------------
 namespace VSTGUI {
@@ -22,14 +26,26 @@ struct TaskWrapper final : std::enable_shared_from_this<TaskWrapper>
 
 	void schedule ()
 	{
+#ifdef __MINGW32__
+		f = std::make_shared<std::future<void>> (std::async (std::launch::async,
+			[This = shared_from_this ()] () {
+				This->task ();
+				This->f = nullptr;
+			}));
+#else
 		f = std::make_shared<concurrency::task<void>> ([This = shared_from_this ()] () {
 			This->task ();
 			This->f = nullptr;
 		});
+#endif
 	}
 
 	Tasks::Task task;
+#ifdef __MINGW32__
+	std::shared_ptr<std::future<void>> f;
+#else
 	std::shared_ptr<concurrency::task<void>> f;
+#endif
 };
 
 //------------------------------------------------------------------------
@@ -153,6 +169,20 @@ struct SerialQueue final : Queue,
 		numTasks++;
 
 		std::lock_guard<std::mutex> guard (mutex);
+#ifdef __MINGW32__
+		if (lastFuture.valid ())
+		{
+			auto prev = std::make_shared<std::future<void>> (std::move (lastFuture));
+			lastFuture = std::async (std::launch::async, [prev, t = std::move (t)] () {
+				prev->wait ();
+				t ();
+			});
+		}
+		else
+		{
+			lastFuture = std::async (std::launch::async, std::move (t));
+		}
+#else
 		if (hasTask)
 		{
 			ctask = ctask.then (std::move (t));
@@ -162,13 +192,20 @@ struct SerialQueue final : Queue,
 			hasTask = true;
 			ctask = concurrency::task<void> (std::move (t));
 		}
+#endif
 	}
 
 private:
+#ifdef __MINGW32__
+	std::string name;
+	mutable std::future<void> lastFuture;
+	mutable std::mutex mutex;
+#else
 	mutable bool hasTask {false};
 	std::string name;
 	mutable concurrency::task<void> ctask;
 	mutable std::mutex mutex;
+#endif
 };
 
 //------------------------------------------------------------------------
