@@ -149,6 +149,11 @@ struct SurfaceRedrawArea : IPlatformTimerCallback
 
 	void restart ()
 	{
+#ifdef __MINGW32__
+		// IDCompositionVisual3::SetOpacity not available in MinGW headers.
+		// DirectComposition is not implemented in Wine, so this is a no-op.
+		auto hr = S_OK;
+#else
 		COM::Ptr<IDCompositionVisual3> vis3;
 		auto hr = surface->visual->QueryInterface (__uuidof(IDCompositionVisual3),
 												   reinterpret_cast<void**> (vis3.adoptPtr ()));
@@ -160,6 +165,7 @@ struct SurfaceRedrawArea : IPlatformTimerCallback
 			hr = animation->End (animationTimeSeconds, 0.0f);
 			vis3->SetOpacity (animation.get ());
 		}
+#endif
 		timer.stop ();
 		timer.start (animationTime);
 	}
@@ -881,6 +887,11 @@ bool VisualSurfacePair::setSize (uint32_t w, uint32_t h)
 //-----------------------------------------------------------------------------
 bool VisualSurfacePair::setOpacity (float o)
 {
+#ifdef __MINGW32__
+	// IDCompositionVisual3::SetOpacity not available in MinGW headers.
+	// DirectComposition is not implemented in Wine, so this is a no-op.
+	auto hr = S_OK;
+#else
 	COM::Ptr<IDCompositionVisual3> vis3;
 	auto hr = visual->QueryInterface (__uuidof(IDCompositionVisual3),
 									  reinterpret_cast<void**> (vis3.adoptPtr ()));
@@ -888,6 +899,7 @@ bool VisualSurfacePair::setOpacity (float o)
 	{
 		hr = vis3->SetOpacity (o);
 	}
+#endif
 	return SUCCEEDED (hr);
 }
 
