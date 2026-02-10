@@ -42,8 +42,13 @@ struct CustomFonts
 		if (auto fs = fontSet.get ())
 		{
 			COM::Ptr<IDWriteFontSet> matchingFonts;
+#ifdef __MINGW32__
+			if (SUCCEEDED (fs->GetMatchingFonts_ (name, fontWeight, fontStretch, fontStyle,
+												  matchingFonts.adoptPtr ())))
+#else
 			if (SUCCEEDED (fs->GetMatchingFonts (name, fontWeight, fontStretch, fontStyle,
 												 matchingFonts.adoptPtr ())))
+#endif
 				return matchingFonts->GetFontCount () > 0;
 		}
 		return false;
