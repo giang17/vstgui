@@ -1,3 +1,8 @@
+# vstgui_standalone is not needed for VST3 plugins and has no MinGW support
+if(MINGW)
+    return()
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 
 include(vstgui_add_executable)
