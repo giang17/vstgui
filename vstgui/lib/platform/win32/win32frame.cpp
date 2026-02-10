@@ -790,6 +790,27 @@ static void setupMouseEventFromWParam (MouseEvent& event, WPARAM wParam)
 //------------------------------------------------------------------------
 static std::u32string convert (std::wstring_view s)
 {
+#ifdef __MINGW32__
+	std::u32string result;
+	result.reserve (s.size ());
+	for (size_t i = 0; i < s.size (); ++i)
+	{
+		char16_t c = static_cast<char16_t> (s[i]);
+		if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.size ())
+		{
+			char16_t c2 = static_cast<char16_t> (s[i + 1]);
+			if (c2 >= 0xDC00 && c2 <= 0xDFFF)
+			{
+				result.push_back (static_cast<char32_t> (
+					((c - 0xD800) << 10) + (c2 - 0xDC00) + 0x10000));
+				++i;
+				continue;
+			}
+		}
+		result.push_back (static_cast<char32_t> (c));
+	}
+	return result;
+#else
 	std::string bytes;
 	bytes.reserve (s.size () * 2);
 
@@ -803,6 +824,7 @@ static std::u32string convert (std::wstring_view s)
 	std::wstring_convert<std::codecvt_utf16<char32_t>, char32_t> convert;
 	return convert.from_bytes (bytes);
 #pragma warning(3 : 4996) // deprecated
+#endif
 }
 
 //-----------------------------------------------------------------------------
