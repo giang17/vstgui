@@ -8,6 +8,7 @@
 #include "winstring.h"
 #include "../../cdrawcontext.h"
 #include "../../cstring.h"
+#include "../iplatformbitmap.h"
 #include "../../cvstguitimer.h"
 #include "win32dll.h"
 #include <dwmapi.h>
@@ -46,11 +47,14 @@ private:
 
 	void paint ();
 
+	void updateLayeredContent ();
+
 	SharedPointer<CBitmap> bitmap;
 	CPoint offset;
 	UTF8String windowClassName;
 	HWND hwnd {nullptr};
 	CCoord scaleFactor {2.};
+	float globalAlpha {1.f};
 };
 
 //-----------------------------------------------------------------------------
@@ -688,9 +692,10 @@ Win32DragBitmapWindow::Win32DragBitmapWindow (const SharedPointer<CBitmap>& bitm
 	auto initialWindowPosition = calculateWindowPosition ();
 	updateScaleFactor (initialWindowPosition);
 	createWindow ();
-	setAlphaTransparency (1.f);
+	globalAlpha = 1.f;
 	updateWindowPosition (initialWindowPosition);
 	showWindow ();
+	updateLayeredContent ();
 }
 
 //-----------------------------------------------------------------------------
@@ -706,9 +711,7 @@ void Win32DragBitmapWindow::updateBitmap (const SharedPointer<CBitmap>& bitmap, 
 	this->bitmap = bitmap;
 	this->offset = offset;
 	updateWindowPosition (calculateWindowPosition ());
-	RECT r;
-	GetClientRect (hwnd, &r);
-	InvalidateRect (hwnd, &r, FALSE);
+	updateLayeredContent ();
 }
 
 //-----------------------------------------------------------------------------
@@ -749,7 +752,14 @@ void Win32DragBitmapWindow::setAlphaTransparency (float alpha)
 {
 	if (!hwnd)
 		return;
-	SetLayeredWindowAttributes (hwnd, 0, static_cast<BYTE> (alpha * 255.), LWA_ALPHA);
+	globalAlpha = alpha;
+	// Use UpdateLayeredWindow for per-pixel alpha instead of SetLayeredWindowAttributes.
+	// SetLayeredWindowAttributes only provides global opacity but doesn't support per-pixel
+	// alpha compositing on Wine (no DWM composition), resulting in a black background.
+	// We trigger a repaint which will call updateLayeredContent() with the current alpha.
+	RECT r;
+	GetClientRect (hwnd, &r);
+	InvalidateRect (hwnd, &r, FALSE);
 }
 
 //-----------------------------------------------------------------------------
@@ -788,31 +798,163 @@ void Win32DragBitmapWindow::paint ()
 {
 	PAINTSTRUCT ps;
 	BeginPaint (hwnd, &ps);
+	EndPaint (hwnd, &ps);
+	updateLayeredContent ();
+}
 
-	RECT clientRect;
-	GetClientRect (hwnd, &clientRect);
+//-----------------------------------------------------------------------------
+void Win32DragBitmapWindow::updateLayeredContent ()
+{
+	if (!hwnd || !bitmap)
+		return;
 
-	CRect rect;
-	rect.setWidth (clientRect.right - clientRect.left);
-	rect.setHeight (clientRect.bottom - clientRect.top);
+	auto platformBitmap = bitmap->getPlatformBitmap ();
+	if (!platformBitmap)
+		return;
 
-	if (auto deviceContext =
-			getPlatformFactory ().asWin32Factory ()->createGraphicsDeviceContext (hwnd))
+	auto pixelAccess = platformBitmap->lockPixels (true);
+	if (!pixelAccess)
+		return;
+
+	auto bitmapSize = platformBitmap->getSize ();
+	int width = static_cast<int> (bitmapSize.x * scaleFactor);
+	int height = static_cast<int> (bitmapSize.y * scaleFactor);
+	int srcWidth = static_cast<int> (bitmapSize.x);
+	int srcHeight = static_cast<int> (bitmapSize.y);
+
+	BITMAPINFO bmi = {};
+	bmi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = srcWidth;
+	bmi.bmiHeader.biHeight = -srcHeight; // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	HDC screenDC = GetDC (nullptr);
+	HDC memDC = CreateCompatibleDC (screenDC);
+
+	void* dibBits = nullptr;
+	HBITMAP dib = CreateDIBSection (memDC, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+	if (!dib || !dibBits)
 	{
-		CDrawContext drawContext (deviceContext, rect, 1.);
-
-		drawContext.beginDraw ();
-
-		drawContext.clearRect (rect);
-		drawContext.setGlobalAlpha (0.9f);
-		CDrawContext::Transform t (drawContext,
-								   CGraphicsTransform ().scale (scaleFactor, scaleFactor));
-		bitmap->draw (&drawContext, rect);
-
-		drawContext.endDraw ();
+		DeleteDC (memDC);
+		ReleaseDC (nullptr, screenDC);
+		return;
 	}
 
-	EndPaint (hwnd, &ps);
+	HGDIOBJ oldBmp = SelectObject (memDC, dib);
+
+	// Copy bitmap pixels into DIB, applying global alpha
+	uint8_t* src = pixelAccess->getAddress ();
+	uint32_t srcPitch = pixelAccess->getBytesPerRow ();
+	auto format = pixelAccess->getPixelFormat ();
+	uint8_t* dst = static_cast<uint8_t*> (dibBits);
+	BYTE ga = static_cast<BYTE> (globalAlpha * 255.f);
+
+	for (int y = 0; y < srcHeight; ++y)
+	{
+		uint8_t* srcRow = src + y * srcPitch;
+		uint8_t* dstRow = dst + y * srcWidth * 4;
+		for (int x = 0; x < srcWidth; ++x)
+		{
+			uint8_t b, g, r, a;
+			// Source is premultiplied BGRA (D2D1/WIC default on Windows)
+			if (format == IPlatformBitmapPixelAccess::kBGRA)
+			{
+				b = srcRow[x * 4 + 0];
+				g = srcRow[x * 4 + 1];
+				r = srcRow[x * 4 + 2];
+				a = srcRow[x * 4 + 3];
+			}
+			else if (format == IPlatformBitmapPixelAccess::kARGB)
+			{
+				a = srcRow[x * 4 + 0];
+				r = srcRow[x * 4 + 1];
+				g = srcRow[x * 4 + 2];
+				b = srcRow[x * 4 + 3];
+			}
+			else if (format == IPlatformBitmapPixelAccess::kRGBA)
+			{
+				r = srcRow[x * 4 + 0];
+				g = srcRow[x * 4 + 1];
+				b = srcRow[x * 4 + 2];
+				a = srcRow[x * 4 + 3];
+			}
+			else
+			{
+				// kABGR
+				a = srcRow[x * 4 + 0];
+				b = srcRow[x * 4 + 1];
+				g = srcRow[x * 4 + 2];
+				r = srcRow[x * 4 + 3];
+			}
+			// Apply global alpha (premultiplied)
+			if (ga < 255)
+			{
+				a = static_cast<uint8_t> ((a * ga) / 255);
+				r = static_cast<uint8_t> ((r * ga) / 255);
+				g = static_cast<uint8_t> ((g * ga) / 255);
+				b = static_cast<uint8_t> ((b * ga) / 255);
+			}
+			// DIB for UpdateLayeredWindow must be premultiplied BGRA
+			dstRow[x * 4 + 0] = b;
+			dstRow[x * 4 + 1] = g;
+			dstRow[x * 4 + 2] = r;
+			dstRow[x * 4 + 3] = a;
+		}
+	}
+
+	// If source and target sizes differ, use StretchBlt to a second DIB
+	HDC finalDC = memDC;
+	HBITMAP finalDib = dib;
+	HDC stretchDC = nullptr;
+	HBITMAP stretchDib = nullptr;
+	HGDIOBJ oldStretchBmp = nullptr;
+
+	if (width != srcWidth || height != srcHeight)
+	{
+		BITMAPINFO bmi2 = bmi;
+		bmi2.bmiHeader.biWidth = width;
+		bmi2.bmiHeader.biHeight = -height;
+
+		void* stretchBits = nullptr;
+		stretchDC = CreateCompatibleDC (screenDC);
+		stretchDib = CreateDIBSection (stretchDC, &bmi2, DIB_RGB_COLORS, &stretchBits, nullptr, 0);
+		if (stretchDib && stretchBits)
+		{
+			oldStretchBmp = SelectObject (stretchDC, stretchDib);
+			SetStretchBltMode (stretchDC, HALFTONE);
+			StretchBlt (stretchDC, 0, 0, width, height, memDC, 0, 0, srcWidth, srcHeight, SRCCOPY);
+			finalDC = stretchDC;
+		}
+	}
+
+	POINT ptSrc = {0, 0};
+	SIZE sizeWnd = {width, height};
+	BLENDFUNCTION blend = {};
+	blend.BlendOp = AC_SRC_OVER;
+	blend.SourceConstantAlpha = 255;
+	blend.AlphaFormat = AC_SRC_ALPHA;
+
+	POINT ptWnd;
+	RECT wr;
+	GetWindowRect (hwnd, &wr);
+	ptWnd.x = wr.left;
+	ptWnd.y = wr.top;
+
+	UpdateLayeredWindow (hwnd, screenDC, &ptWnd, &sizeWnd, finalDC, &ptSrc, 0, &blend, ULW_ALPHA);
+
+	// Cleanup
+	SelectObject (memDC, oldBmp);
+	DeleteObject (dib);
+	DeleteDC (memDC);
+	if (stretchDC)
+	{
+		if (oldStretchBmp) SelectObject (stretchDC, oldStretchBmp);
+		if (stretchDib) DeleteObject (stretchDib);
+		DeleteDC (stretchDC);
+	}
+	ReleaseDC (nullptr, screenDC);
 }
 
 //-----------------------------------------------------------------------------
